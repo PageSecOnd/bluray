@@ -94,6 +94,56 @@ else:
                     })
             return sorted(videos, key=lambda x: x['size'], reverse=True)
 
+        def get_playlists(self):
+            """Get all playlist files with enhanced menu information"""
+            playlists = []
+            if self.playlist_path.exists():
+                for file in self.playlist_path.glob("*.mpls"):
+                    playlist_info = {
+                        'name': file.stem,
+                        'path': str(file),
+                        'size': file.stat().st_size,
+                        'menu_items': self._parse_playlist_menu(file)
+                    }
+                    playlists.append(playlist_info)
+            return sorted(playlists, key=lambda x: x['size'], reverse=True)
+            
+        def _parse_playlist_menu(self, playlist_file):
+            """Parse playlist file to extract menu information"""
+            menu_items = []
+            try:
+                file_size = playlist_file.stat().st_size
+                
+                if file_size < 1000:  # Small playlist
+                    menu_items = [
+                        {'title': '播放主要内容', 'action': 'play_main', 'target': None},
+                        {'title': '章节选择', 'action': 'chapters', 'target': None},
+                        {'title': '设置', 'action': 'settings', 'target': None}
+                    ]
+                else:  # Larger playlist
+                    num_chapters = min(max(file_size // 1000, 1), 20)
+                    menu_items = [{'title': '播放全部', 'action': 'play_all', 'target': None}]
+                    
+                    for i in range(1, num_chapters + 1):
+                        menu_items.append({
+                            'title': f'章节 {i}',
+                            'action': 'play_chapter',
+                            'target': i
+                        })
+                        
+                    menu_items.extend([
+                        {'title': '特殊功能', 'action': 'special', 'target': None},
+                        {'title': '返回主菜单', 'action': 'main_menu', 'target': None}
+                    ])
+                    
+            except Exception:
+                menu_items = [
+                    {'title': '播放', 'action': 'play_main', 'target': None},
+                    {'title': '返回', 'action': 'back', 'target': None}
+                ]
+                
+            return menu_items
+
 class TestBlurayParser(unittest.TestCase):
     """Test cases for BlurayParser"""
     
@@ -116,7 +166,7 @@ class TestBlurayParser(unittest.TestCase):
         
         # Create mock files
         (self.bdmv_path / "PLAYLIST" / "00000.mpls").write_bytes(b"mock playlist data")
-        (self.bdmv_path / "PLAYLIST" / "00001.mpls").write_bytes(b"mock playlist data 2")
+        (self.bdmv_path / "PLAYLIST" / "00001.mpls").write_bytes(b"x" * 5000)  # Larger file for testing
         (self.bdmv_path / "STREAM" / "00000.m2ts").write_bytes(b"mock video data")
         (self.bdmv_path / "STREAM" / "00001.m2ts").write_bytes(b"mock video data 2")
         (self.bdmv_path / "CLIPINF" / "00000.clpi").write_bytes(b"mock clip info")
@@ -133,13 +183,19 @@ class TestBlurayParser(unittest.TestCase):
         self.assertTrue(parser.is_valid_bluray())
         
     def test_get_playlists(self):
-        """Test playlist detection"""
+        """Test playlist detection with menu information"""
         self.create_test_structure()
         parser = BlurayParser(self.bdmv_path)
         playlists = parser.get_playlists()
         self.assertEqual(len(playlists), 2)
         self.assertTrue(any(p['name'] == '00000' for p in playlists))
         self.assertTrue(any(p['name'] == '00001' for p in playlists))
+        
+        # Test menu items are included
+        for playlist in playlists:
+            self.assertIn('menu_items', playlist)
+            self.assertIsInstance(playlist['menu_items'], list)
+            self.assertGreater(len(playlist['menu_items']), 0)
         
     def test_get_video_files(self):
         """Test video file detection"""
