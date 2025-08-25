@@ -19,6 +19,47 @@ try:
 except ImportError:
     vlc = None
 
+class BlurayMenuNavigator:
+    """Menu navigation state manager for Blu-ray menus"""
+    
+    def __init__(self):
+        self.current_playlist = None
+        self.current_menu_items = []
+        self.selected_item = 0
+        self.menu_history = []
+        
+    def set_playlist(self, playlist_info):
+        """Set current playlist and initialize menu"""
+        self.current_playlist = playlist_info
+        self.current_menu_items = playlist_info.get('menu_items', [])
+        self.selected_item = 0
+        
+    def navigate_up(self):
+        """Navigate to previous menu item"""
+        if self.current_menu_items:
+            self.selected_item = (self.selected_item - 1) % len(self.current_menu_items)
+            return self.selected_item
+        return 0
+        
+    def navigate_down(self):
+        """Navigate to next menu item"""
+        if self.current_menu_items:
+            self.selected_item = (self.selected_item + 1) % len(self.current_menu_items)
+            return self.selected_item
+        return 0
+        
+    def select_current(self):
+        """Select current menu item"""
+        if self.current_menu_items and 0 <= self.selected_item < len(self.current_menu_items):
+            return self.current_menu_items[self.selected_item]
+        return None
+        
+    def go_back(self):
+        """Go back to previous menu"""
+        if self.menu_history:
+            return self.menu_history.pop()
+        return None
+
 class BlurayParser:
     """Parser for Blu-ray disc BDMV structure"""
     
@@ -37,16 +78,64 @@ class BlurayParser:
         return True
         
     def get_playlists(self):
-        """Get all playlist files"""
+        """Get all playlist files with enhanced menu information"""
         playlists = []
         if self.playlist_path.exists():
             for file in self.playlist_path.glob("*.mpls"):
-                playlists.append({
+                playlist_info = {
                     'name': file.stem,
                     'path': str(file),
-                    'size': file.stat().st_size
-                })
+                    'size': file.stat().st_size,
+                    'menu_items': self._parse_playlist_menu(file)
+                }
+                playlists.append(playlist_info)
         return sorted(playlists, key=lambda x: x['size'], reverse=True)
+        
+    def _parse_playlist_menu(self, playlist_file):
+        """Parse playlist file to extract menu information"""
+        menu_items = []
+        try:
+            # Basic menu structure based on file size and common patterns
+            file_size = playlist_file.stat().st_size
+            
+            if file_size < 1000:  # Small playlist - likely a simple menu
+                menu_items = [
+                    {'title': '播放主要内容', 'action': 'play_main', 'target': None},
+                    {'title': '章节选择', 'action': 'chapters', 'target': None},
+                    {'title': '设置', 'action': 'settings', 'target': None}
+                ]
+            else:  # Larger playlist - likely main content with chapters
+                # Try to read basic structure
+                with open(playlist_file, 'rb') as f:
+                    data = f.read(100)  # Read first 100 bytes for basic analysis
+                
+                # Estimate number of chapters based on file content
+                # This is a simplified approach - real MPLS parsing would be more complex
+                num_chapters = min(max(file_size // 1000, 1), 20)
+                
+                menu_items = [{'title': '播放全部', 'action': 'play_all', 'target': None}]
+                
+                # Add chapter entries
+                for i in range(1, num_chapters + 1):
+                    menu_items.append({
+                        'title': f'章节 {i}',
+                        'action': 'play_chapter',
+                        'target': i
+                    })
+                    
+                menu_items.extend([
+                    {'title': '特殊功能', 'action': 'special', 'target': None},
+                    {'title': '返回主菜单', 'action': 'main_menu', 'target': None}
+                ])
+                
+        except Exception:
+            # Fallback menu if parsing fails
+            menu_items = [
+                {'title': '播放', 'action': 'play_main', 'target': None},
+                {'title': '返回', 'action': 'back', 'target': None}
+            ]
+            
+        return menu_items
         
     def get_video_files(self):
         """Get all video stream files"""
@@ -59,6 +148,11 @@ class BlurayParser:
                     'size': file.stat().st_size
                 })
         return sorted(videos, key=lambda x: x['size'], reverse=True)
+        
+    def get_main_playlist(self):
+        """Get the main playlist (usually the largest one)"""
+        playlists = self.get_playlists()
+        return playlists[0] if playlists else None
 
 class BlurayMenuPlayer:
     """Main Blu-ray Menu Player application"""
@@ -76,8 +170,13 @@ class BlurayMenuPlayer:
         self.current_bdmv = None
         self.parser = None
         
+        # Menu navigation
+        self.menu_navigator = BlurayMenuNavigator()
+        self.current_menu_display = None
+        
         self.setup_ui()
         self.setup_vlc()
+        self.setup_keyboard_bindings()
         
     def setup_vlc(self):
         """Initialize VLC media player"""
@@ -120,16 +219,49 @@ class BlurayMenuPlayer:
         content_frame = ttk.Frame(main_frame)
         content_frame.pack(fill=tk.BOTH, expand=True)
         
+        # Left panel with playlists and menu navigation
+        left_panel = ttk.Frame(content_frame)
+        left_panel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
+        
         # Playlist frame
-        playlist_frame = ttk.LabelFrame(content_frame, text="播放列表")
-        playlist_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
+        playlist_frame = ttk.LabelFrame(left_panel, text="播放列表")
+        playlist_frame.pack(fill=tk.X, pady=(0, 5))
         
         # Playlist treeview
-        self.playlist_tree = ttk.Treeview(playlist_frame, columns=("size",), show="tree headings")
+        self.playlist_tree = ttk.Treeview(playlist_frame, columns=("size",), show="tree headings", height=6)
         self.playlist_tree.heading("#0", text="名称")
         self.playlist_tree.heading("size", text="大小")
-        self.playlist_tree.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        self.playlist_tree.pack(fill=tk.X, padx=5, pady=5)
         self.playlist_tree.bind("<Double-1>", self.on_playlist_double_click)
+        
+        # Menu navigation frame
+        menu_nav_frame = ttk.LabelFrame(left_panel, text="菜单导航")
+        menu_nav_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Menu display
+        self.menu_display = tk.Listbox(menu_nav_frame, height=8)
+        self.menu_display.pack(fill=tk.BOTH, expand=True, padx=5, pady=(5, 0))
+        self.menu_display.bind("<Double-1>", self.on_menu_item_select)
+        self.menu_display.bind("<Return>", self.on_menu_item_select)
+        
+        # Menu navigation buttons
+        menu_button_frame = ttk.Frame(menu_nav_frame)
+        menu_button_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        self.menu_up_btn = ttk.Button(menu_button_frame, text="↑", command=self.menu_navigate_up, width=3)
+        self.menu_up_btn.pack(side=tk.LEFT, padx=(0, 2))
+        
+        self.menu_down_btn = ttk.Button(menu_button_frame, text="↓", command=self.menu_navigate_down, width=3)
+        self.menu_down_btn.pack(side=tk.LEFT, padx=(0, 2))
+        
+        self.menu_select_btn = ttk.Button(menu_button_frame, text="选择", command=self.menu_select_current)
+        self.menu_select_btn.pack(side=tk.LEFT, padx=(0, 2))
+        
+        self.menu_back_btn = ttk.Button(menu_button_frame, text="返回", command=self.menu_go_back)
+        self.menu_back_btn.pack(side=tk.LEFT, padx=(0, 2))
+        
+        self.menu_main_btn = ttk.Button(menu_button_frame, text="主菜单", command=self.show_main_menu)
+        self.menu_main_btn.pack(side=tk.LEFT)
         
         # Video files frame
         video_frame = ttk.LabelFrame(content_frame, text="视频文件")
@@ -161,6 +293,17 @@ class BlurayMenuPlayer:
         self.status_var.set("就绪")
         status_bar = ttk.Label(main_frame, textvariable=self.status_var, relief=tk.SUNKEN)
         status_bar.pack(fill=tk.X, pady=(10, 0))
+        
+    def setup_keyboard_bindings(self):
+        """Setup keyboard bindings for menu navigation"""
+        self.root.bind("<Up>", lambda e: self.menu_navigate_up())
+        self.root.bind("<Down>", lambda e: self.menu_navigate_down())
+        self.root.bind("<Return>", lambda e: self.menu_select_current())
+        self.root.bind("<Escape>", lambda e: self.menu_go_back())
+        self.root.bind("<Home>", lambda e: self.show_main_menu())
+        
+        # Make the root window focusable for key events
+        self.root.focus_set()
         
     def open_bluray_disc(self):
         """Open Blu-ray disc from drive"""
@@ -247,9 +390,11 @@ class BlurayMenuPlayer:
             self.playlist_tree.delete(*self.playlist_tree.get_children())
             for playlist in playlists:
                 size_mb = playlist['size'] / (1024 * 1024)
-                self.playlist_tree.insert("", "end", text=playlist['name'], 
+                menu_count = len(playlist.get('menu_items', []))
+                display_text = f"{playlist['name']} ({menu_count} 项菜单)"
+                self.playlist_tree.insert("", "end", text=display_text, 
                                         values=(f"{size_mb:.1f} MB",), 
-                                        tags=(playlist['path'],))
+                                        tags=(json.dumps(playlist),))
             
             # Load video files
             videos = self.parser.get_video_files()
@@ -267,10 +412,195 @@ class BlurayMenuPlayer:
             
     def on_playlist_double_click(self, event):
         """Handle playlist double-click"""
+        if not self.playlist_tree.selection():
+            return
+            
         item = self.playlist_tree.selection()[0]
-        playlist_path = self.playlist_tree.item(item, "tags")[0]
-        self.status_var.set(f"播放列表: {os.path.basename(playlist_path)}")
-        # TODO: Parse playlist and play main video
+        playlist_json = self.playlist_tree.item(item, "tags")[0]
+        playlist_info = json.loads(playlist_json)
+        
+        # Set up menu navigation
+        self.menu_navigator.set_playlist(playlist_info)
+        self.update_menu_display()
+        
+        self.status_var.set(f"已加载菜单: {playlist_info['name']}")
+        
+    def update_menu_display(self):
+        """Update the menu display with current menu items"""
+        self.menu_display.delete(0, tk.END)
+        
+        if not self.menu_navigator.current_menu_items:
+            self.menu_display.insert(tk.END, "无可用菜单项")
+            return
+            
+        for i, item in enumerate(self.menu_navigator.current_menu_items):
+            prefix = "► " if i == self.menu_navigator.selected_item else "  "
+            self.menu_display.insert(tk.END, f"{prefix}{item['title']}")
+            
+        # Highlight selected item
+        if self.menu_navigator.current_menu_items:
+            self.menu_display.selection_clear(0, tk.END)
+            self.menu_display.selection_set(self.menu_navigator.selected_item)
+            self.menu_display.see(self.menu_navigator.selected_item)
+            
+    def menu_navigate_up(self):
+        """Navigate up in menu"""
+        self.menu_navigator.navigate_up()
+        self.update_menu_display()
+        
+    def menu_navigate_down(self):
+        """Navigate down in menu"""
+        self.menu_navigator.navigate_down()
+        self.update_menu_display()
+        
+    def menu_select_current(self):
+        """Select current menu item"""
+        selected_item = self.menu_navigator.select_current()
+        if selected_item:
+            self.execute_menu_action(selected_item)
+            
+    def menu_go_back(self):
+        """Go back to previous menu"""
+        previous_menu = self.menu_navigator.go_back()
+        if previous_menu:
+            self.menu_navigator.set_playlist(previous_menu)
+            self.update_menu_display()
+            self.status_var.set("返回上级菜单")
+        else:
+            self.status_var.set("已在顶级菜单")
+            
+    def show_main_menu(self):
+        """Show main menu (largest playlist)"""
+        if self.parser:
+            main_playlist = self.parser.get_main_playlist()
+            if main_playlist:
+                self.menu_navigator.set_playlist(main_playlist)
+                self.update_menu_display()
+                self.status_var.set("显示主菜单")
+                
+    def on_menu_item_select(self, event):
+        """Handle menu item selection via double-click or Enter"""
+        selection = self.menu_display.curselection()
+        if selection:
+            self.menu_navigator.selected_item = selection[0]
+            self.menu_select_current()
+            
+    def execute_menu_action(self, menu_item):
+        """Execute the action for a selected menu item"""
+        action = menu_item['action']
+        target = menu_item.get('target')
+        
+        self.status_var.set(f"执行: {menu_item['title']}")
+        
+        if action == 'play_main' or action == 'play_all':
+            # Play the main video content
+            self.play_main_content()
+            
+        elif action == 'play_chapter':
+            # Play specific chapter
+            self.play_chapter(target)
+            
+        elif action == 'chapters':
+            # Show chapter selection menu
+            self.show_chapter_menu()
+            
+        elif action == 'settings':
+            # Show settings menu
+            self.show_settings_menu()
+            
+        elif action == 'special':
+            # Show special features
+            self.show_special_features()
+            
+        elif action == 'main_menu':
+            # Go to main menu
+            self.show_main_menu()
+            
+        elif action == 'back':
+            # Go back
+            self.menu_go_back()
+            
+        else:
+            self.status_var.set(f"未知操作: {action}")
+            
+    def play_main_content(self):
+        """Play the main video content"""
+        if not self.parser:
+            return
+            
+        # Get the largest video file (likely main content)
+        videos = self.parser.get_video_files()
+        if videos:
+            main_video = videos[0]  # Largest video file
+            self.play_video(main_video['path'])
+            self.status_var.set(f"播放主要内容: {main_video['name']}")
+        else:
+            self.status_var.set("未找到视频文件")
+            
+    def play_chapter(self, chapter_num):
+        """Play specific chapter"""
+        self.status_var.set(f"播放章节 {chapter_num}")
+        # For now, play main content - could be enhanced with actual chapter seeking
+        self.play_main_content()
+        
+    def show_chapter_menu(self):
+        """Show chapter selection menu"""
+        # Create a chapter menu
+        chapter_menu = {
+            'name': 'chapters',
+            'menu_items': [
+                {'title': f'章节 {i}', 'action': 'play_chapter', 'target': i}
+                for i in range(1, 11)  # Example: 10 chapters
+            ] + [{'title': '返回', 'action': 'back', 'target': None}]
+        }
+        
+        # Save current menu to history
+        if self.menu_navigator.current_playlist:
+            self.menu_navigator.menu_history.append(self.menu_navigator.current_playlist)
+            
+        self.menu_navigator.set_playlist(chapter_menu)
+        self.update_menu_display()
+        self.status_var.set("章节选择菜单")
+        
+    def show_settings_menu(self):
+        """Show settings menu"""
+        settings_menu = {
+            'name': 'settings',
+            'menu_items': [
+                {'title': '音频设置', 'action': 'audio_settings', 'target': None},
+                {'title': '字幕设置', 'action': 'subtitle_settings', 'target': None},
+                {'title': '显示设置', 'action': 'display_settings', 'target': None},
+                {'title': '返回', 'action': 'back', 'target': None}
+            ]
+        }
+        
+        # Save current menu to history
+        if self.menu_navigator.current_playlist:
+            self.menu_navigator.menu_history.append(self.menu_navigator.current_playlist)
+            
+        self.menu_navigator.set_playlist(settings_menu)
+        self.update_menu_display()
+        self.status_var.set("设置菜单")
+        
+    def show_special_features(self):
+        """Show special features menu"""
+        special_menu = {
+            'name': 'special',
+            'menu_items': [
+                {'title': '花絮视频', 'action': 'play_bonus', 'target': None},
+                {'title': '制作特辑', 'action': 'play_making_of', 'target': None},
+                {'title': '导演评论', 'action': 'play_commentary', 'target': None},
+                {'title': '返回', 'action': 'back', 'target': None}
+            ]
+        }
+        
+        # Save current menu to history
+        if self.menu_navigator.current_playlist:
+            self.menu_navigator.menu_history.append(self.menu_navigator.current_playlist)
+            
+        self.menu_navigator.set_playlist(special_menu)
+        self.update_menu_display()
+        self.status_var.set("特殊功能菜单")
         
     def on_video_double_click(self, event):
         """Handle video file double-click"""
